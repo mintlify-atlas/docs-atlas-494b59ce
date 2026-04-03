@@ -1,0 +1,459 @@
+---
+title: API reference
+description: Complete reference for every public method and macro in the activerecord-multi-tenant gem.
+---
+
+## MultiTenant module methods
+
+The `MultiTenant` module is the central API for managing tenant context at runtime.
+
+### `MultiTenant.with`
+
+Sets the current tenant for the duration of the block, then restores the previous tenant on exit — even if an exception is raised.
+
+```ruby
+MultiTenant.with(current_account) do
+  # all queries inside this block are scoped to current_account
+  sites = Site.all
+end
+```
+
+If the given tenant is already the current tenant, the block is called immediately without any context switch.
+
+<ParamField path="tenant" type="ActiveRecord::Base | String | Integer" required>
+  The tenant object or raw tenant ID to set as the current tenant.
+</ParamField>
+
+<ParamField path="block" type="Proc" required>
+  The block to execute within the tenant context.
+</ParamField>
+
+<Note>
+  `MultiTenant.with_id` is an alias for `MultiTenant.with` kept for backward compatibility.
+</Note>
+
+---
+
+### `MultiTenant.without`
+
+Clears the tenant context for the duration of the block, then restores the previous tenant on exit. Useful for running cross-tenant administrative queries.
+
+```ruby
+MultiTenant.without do
+  # tenant scope is lifted — queries touch all tenants
+  Account.find_each { |a| a.recalculate_usage! }
+end
+```
+
+<ParamField path="block" type="Proc" required>
+  The block to execute without any tenant context.
+</ParamField>
+
+---
+
+### `MultiTenant.current_tenant`
+
+Returns the currently active tenant. This is either a full ActiveRecord object or a raw ID value, depending on how the tenant was set.
+
+```ruby
+tenant = MultiTenant.current_tenant
+# => #<Account id: 42, name: "Acme">
+```
+
+---
+
+### `MultiTenant.current_tenant=`
+
+Sets the current tenant directly, outside of a block. The value persists for the lifetime of the current thread / request (backed by `ActiveSupport::CurrentAttributes`).
+
+```ruby
+MultiTenant.current_tenant = Account.find(params[:account_id])
+```
+
+<ParamField path="tenant" type="ActiveRecord::Base | String | Integer | nil">
+  The tenant to set. Pass `nil` to clear the current tenant.
+</ParamField>
+
+---
+
+### `MultiTenant.current_tenant_id`
+
+Returns only the tenant's ID, regardless of whether the current tenant was set as an object or a raw ID.
+
+```ruby
+MultiTenant.current_tenant_id
+# => 42
+```
+
+---
+
+### `MultiTenant.current_tenant_is_id?`
+
+Returns `true` when the current tenant was set as a raw `String` or `Integer` rather than an ActiveRecord object.
+
+```ruby
+MultiTenant.current_tenant = 42
+MultiTenant.current_tenant_is_id? # => true
+
+MultiTenant.current_tenant = Account.first
+MultiTenant.current_tenant_is_id? # => false
+```
+
+---
+
+### `MultiTenant.current_tenant_class`
+
+Returns the class name of the current tenant as a `String`. When the tenant is set as a raw ID, this falls back to `MultiTenant.default_tenant_class`. Raises if the tenant is an ID and no default class has been configured.
+
+```ruby
+MultiTenant.current_tenant_class
+# => "Account"
+```
+
+<Warning>
+  This method raises `RuntimeError` with the message `"Only have tenant id, and no default tenant class set"` if `current_tenant_is_id?` is `true` and `default_tenant_class` is `nil`.
+</Warning>
+
+---
+
+### `MultiTenant.load_current_tenant!`
+
+Loads and returns the full tenant ActiveRecord object when only a raw ID is currently set. Replaces the raw-ID value in the current context with the loaded object.
+
+Requires `MultiTenant.default_tenant_class=` to be configured.
+
+```ruby
+# Tenant was set as a raw id (e.g. from a Sidekiq job)
+MultiTenant.current_tenant = 42
+tenant = MultiTenant.load_current_tenant!
+# => #<Account id: 42>
+```
+
+<Warning>
+  Raises `RuntimeError` if `current_tenant` is `nil` or if `default_tenant_class` is not set.
+</Warning>
+
+---
+
+### `MultiTenant.enable_write_only_mode`
+
+Enables write-only mode globally. In this mode, the tenant ID is stamped on new records but is **not** added as a filter to `SELECT`, `UPDATE`, or `DELETE` queries.
+
+This is useful during step-by-step data migrations where you are backfilling a tenant ID column.
+
+```ruby
+# config/initializers/multi_tenant.rb
+MultiTenant.enable_write_only_mode
+```
+
+---
+
+### `MultiTenant.with_write_only_mode_enabled?`
+
+Returns `true` if write-only mode has been enabled.
+
+```ruby
+MultiTenant.with_write_only_mode_enabled? # => true
+```
+
+---
+
+### `MultiTenant.enable_query_monitor`
+
+Enables the query monitor, which logs a `WARNING` to `Rails.logger` whenever a query raises an exception and no tenant is currently set. Useful for tracking down queries that escape tenant scoping.
+
+```ruby
+# config/initializers/multi_tenant.rb
+MultiTenant.enable_query_monitor
+```
+
+---
+
+### `MultiTenant.query_monitor_enabled?`
+
+Returns `true` if the query monitor has been enabled.
+
+```ruby
+MultiTenant.query_monitor_enabled? # => true
+```
+
+---
+
+### `MultiTenant.default_tenant_class=`
+
+Sets the default tenant class used when the current tenant is stored as a raw ID. Required for `current_tenant_class` and `load_current_tenant!` to work in ID-only contexts (e.g. Sidekiq jobs).
+
+```ruby
+# config/initializers/multi_tenant.rb
+MultiTenant.default_tenant_class = Account
+```
+
+<ParamField path="tenant_class" type="Class" required>
+  The ActiveRecord model class to use as the default tenant (e.g. `Account`).
+</ParamField>
+
+---
+
+### `MultiTenant.wrap_methods`
+
+Wraps the named instance methods on `klass` so that each call automatically runs within `MultiTenant.with(owner.partition_key_value)` when no tenant is currently set and `owner` is a persisted multi-tenant record.
+
+This is used internally to instrument `ActiveRecord::Base`, `ActiveRecord::Associations::Association`, and `ActiveRecord::Associations::CollectionProxy`.
+
+```ruby
+MultiTenant.wrap_methods(MyDecorator, 'self', :expensive_query)
+```
+
+<ParamField path="klass" type="Class" required>
+  The class whose methods you want to wrap.
+</ParamField>
+
+<ParamField path="owner" type="String" required>
+  A Ruby expression (evaluated inside the method body) that resolves to the owning ActiveRecord instance — for example `'self'` or `'@association.owner'`.
+</ParamField>
+
+<ParamField path="method_names" type="Symbol | Array<Symbol>" required>
+  One or more method names to wrap.
+</ParamField>
+
+---
+
+## Model macro
+
+### `multi_tenant`
+
+Declares that a model is scoped to a tenant. Call this macro once inside your ActiveRecord model class.
+
+```ruby
+class Project < ApplicationRecord
+  multi_tenant :account
+end
+```
+
+When called on the **tenant model itself** (e.g. `Account`), it sets up the `before_create` hook that pre-assigns a primary key to work around a Citus limitation.
+
+<ParamField path="tenant_name" type="Symbol" required>
+  The name of the tenant association, e.g. `:account`. The gem derives the foreign key as `<tenant_name>_id` unless overridden with `partition_key:`.
+</ParamField>
+
+<ParamField path="partition_key" type="String">
+  Override the default foreign key column name. Defaults to `"<tenant_name>_id"`.
+
+  ```ruby
+  multi_tenant :account, partition_key: 'organization_id'
+  ```
+</ParamField>
+
+<ParamField path="class_name" type="String">
+  Specify a non-standard class name for the tenant association when the class name cannot be inferred from `tenant_name`.
+
+  ```ruby
+  multi_tenant :account, class_name: 'Organization'
+  ```
+</ParamField>
+
+<ParamField path="inverse_of" type="Symbol">
+  Passed through to the `belongs_to` declaration to set the inverse association name.
+
+  ```ruby
+  multi_tenant :account, inverse_of: :projects
+  ```
+</ParamField>
+
+<ParamField path="optional" type="Boolean">
+  When `true`, the generated `belongs_to` association is optional (no presence validation). Defaults to `false`.
+
+  ```ruby
+  multi_tenant :account, optional: true
+  ```
+</ParamField>
+
+---
+
+## Controller macro
+
+### `set_current_tenant_through_filter`
+
+Enables the `set_current_tenant` and `current_tenant` helpers inside a controller. Call it at the class level, then use `set_current_tenant` in a `before_action`.
+
+```ruby
+class ApplicationController < ActionController::Base
+  set_current_tenant_through_filter
+
+  before_action :authenticate_and_set_tenant
+
+  private
+
+  def authenticate_and_set_tenant
+    @current_account = Account.find_by!(subdomain: request.subdomain)
+    set_current_tenant(@current_account)
+  end
+end
+```
+
+`current_tenant` is automatically available as a view helper method.
+
+---
+
+## Migration helpers
+
+These methods are mixed into `ActiveRecord::Migration` and are available inside any migration file.
+
+### `create_distributed_table`
+
+Distributes a table across Citus shards by the given partition key. The operation is reversible — rolling back calls `undistribute_table`.
+
+```ruby
+create_distributed_table :projects, :account_id
+```
+
+<ParamField path="table_name" type="String | Symbol" required>
+  The name of the table to distribute.
+</ParamField>
+
+<ParamField path="partition_key" type="String | Symbol" required>
+  The column to use as the Citus distribution key.
+</ParamField>
+
+<Note>
+  This is a no-op when Citus is not installed, so migrations remain portable.
+</Note>
+
+---
+
+### `create_reference_table`
+
+Creates a Citus reference table — a table replicated to every worker node. The operation is reversible — rolling back calls `undistribute_table`.
+
+```ruby
+create_reference_table :countries
+```
+
+<ParamField path="table_name" type="String | Symbol" required>
+  The name of the table to make a reference table.
+</ParamField>
+
+---
+
+### `undistribute_table`
+
+Removes the Citus distribution from a table, converting it back to a regular PostgreSQL table.
+
+```ruby
+undistribute_table :projects
+```
+
+<ParamField path="table_name" type="String | Symbol" required>
+  The name of the distributed or reference table to undistribute.
+</ParamField>
+
+---
+
+### `rebalance_table_shards`
+
+Triggers Citus to rebalance shards across all worker nodes. Useful after adding new nodes to the cluster.
+
+```ruby
+rebalance_table_shards
+```
+
+---
+
+### `execute_on_all_nodes`
+
+Executes the given SQL statement on the coordinator **and** on every Citus worker node. Handles version differences between Citus 6.0 and later releases automatically.
+
+```ruby
+execute_on_all_nodes "CREATE INDEX CONCURRENTLY ..."
+```
+
+<ParamField path="sql" type="String" required>
+  The SQL statement to execute.
+</ParamField>
+
+---
+
+### `enable_extension_on_all_nodes`
+
+Installs a PostgreSQL extension on the coordinator and all worker nodes using `CREATE EXTENSION IF NOT EXISTS`.
+
+```ruby
+enable_extension_on_all_nodes 'pg_trgm'
+```
+
+<ParamField path="extension" type="String" required>
+  The name of the PostgreSQL extension to enable.
+</ParamField>
+
+---
+
+### `create_table` with `partition_key:`
+
+The gem patches `ActiveRecord::ConnectionAdapters::SchemaStatements#create_table` to accept a `partition_key:` option. When provided (and different from `id`), it drops the default single-column primary key and replaces it with a composite primary key `(partition_key, id)` — required by Citus for distributed tables.
+
+```ruby
+create_table :projects, partition_key: :account_id do |t|
+  t.bigint  :account_id, null: false
+  t.string  :name
+  t.timestamps
+end
+```
+
+<ParamField path="partition_key" type="String | Symbol">
+  The column that will be the first component of the composite primary key. Must match the Citus distribution column.
+</ParamField>
+
+---
+
+## Sidekiq
+
+### `Sidekiq::Client.push_bulk_with_tenants`
+
+Enqueues multiple Sidekiq jobs in a single call, stamping each job with its own tenant context. Returns an array of Sidekiq job IDs (`jid` strings).
+
+```ruby
+Sidekiq::Client.push_bulk_with_tenants(
+  'class' => ReportWorker,
+  'jobs'  => [
+    { 'args' => [report_id_1], 'tenant_id' => 1 },
+    { 'args' => [report_id_2], 'tenant_id' => 7 },
+    { 'args' => [report_id_3], 'tenant_id' => 42 },
+  ]
+)
+```
+
+<ParamField path="items" type="Hash" required>
+  A hash with the following keys:
+
+  - `'class'` — the Sidekiq worker class (e.g. `ReportWorker`).
+  - `'jobs'` — an `Array` of job hashes. Each job hash must include:
+    - `'args'` — the array of arguments to pass to `perform`.
+    - `'tenant_id'` — the tenant ID (Integer or String) under which this job should execute.
+</ParamField>
+
+<Note>
+  The Sidekiq client middleware automatically stamps single-job pushes with the current tenant when `MultiTenant.current_tenant` is set, so `push_bulk_with_tenants` is only needed when you want to enqueue jobs for **multiple different tenants** in one call.
+</Note>
+
+---
+
+## Exceptions
+
+### `MultiTenant::TenantIsImmutable`
+
+Raised when you attempt to change the `tenant_id` (partition key) of a record that has already been persisted. Tenant ownership is permanent once a record is saved.
+
+```ruby
+project = Project.first         # tenant_id = 1
+project.account_id = 99         # => raises MultiTenant::TenantIsImmutable
+```
+
+### `MultiTenant::MissingTenantError`
+
+Raised when a tenant is expected to be present but is not set. The gem raises this automatically inside `has_and_belongs_to_many` join records when `tenant_enabled: true` is configured and no tenant is active at the time the join record is created.
+
+```ruby
+# Raised automatically by the HABTM before_create callback:
+# MultiTenant::MissingTenantError: Tenant Id is not set
+manager.tasks << task  # raises if no current tenant is set
+```

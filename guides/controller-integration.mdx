@@ -1,0 +1,82 @@
+---
+title: "Controller integration"
+description: "Set the current tenant once per request using a before_action, making it available to every query in that request."
+---
+
+## Setting the tenant via a filter
+
+The most common pattern is to resolve the current tenant in a `before_action` and call `set_current_tenant`. You must first call `set_current_tenant_through_filter` at the class level to opt in:
+
+```ruby
+class ApplicationController < ActionController::Base
+  set_current_tenant_through_filter # required to enable set_current_tenant
+
+  before_action :set_customer_as_tenant
+
+  def set_customer_as_tenant
+    customer = Customer.find(session[:current_customer_id])
+    set_current_tenant(customer)
+  end
+end
+```
+
+Every query that runs during the request inherits this tenant context. You do not need to pass the tenant around manually.
+
+## Why `set_current_tenant_through_filter` is required
+
+Calling `set_current_tenant_through_filter` is an explicit opt-in. It defines the private `set_current_tenant` and `current_tenant` methods on your controller class. Without it, those methods are not available and attempting to call them will raise `NoMethodError`.
+
+This design prevents accidental tenant leakage: the gem does not silently intercept requests.
+
+## Setting tenant by ID
+
+You can pass a model instance or a raw ID to `set_current_tenant`. Passing an ID avoids an extra database query when you only need the tenant ID for routing purposes:
+
+```ruby
+def set_customer_as_tenant
+  set_current_tenant(session[:current_customer_id])  # integer or string ID
+end
+```
+
+When an ID is stored, `MultiTenant.current_tenant_is_id?` returns `true`. The query rewriter uses `MultiTenant.current_tenant_id` in both cases, so all scoping works the same way.
+
+## The `current_tenant` helper in views
+
+`set_current_tenant_through_filter` also calls `helper_method :current_tenant`, making `current_tenant` available directly in your views and view helpers without any additional configuration:
+
+```erb
+<p>Logged in as: <%= current_tenant.name %></p>
+```
+
+## Using `MultiTenant.with` outside controllers
+
+For code that runs outside the request cycle — service objects, rake tasks, console sessions — use `MultiTenant.with` to scope a block:
+
+```ruby
+customer = Customer.find(session[:current_customer_id])
+
+MultiTenant.with(customer) do
+  site = Site.find(params[:site_id])
+  site.update! last_accessed_at: Time.now
+  site.page_views.count
+end
+```
+
+`MultiTenant.with` saves and restores the previous tenant on exit, so it is safe to nest calls and use inside background jobs:
+
+```ruby
+MultiTenant.with(customer_a) do
+  MultiTenant.with(customer_b) do
+    # scoped to customer_b
+  end
+  # back to customer_a
+end
+```
+
+Pass a raw ID instead of a model instance when you do not want to load the tenant record:
+
+```ruby
+MultiTenant.with(42) do
+  PageView.count  # WHERE customer_id = 42
+end
+```

@@ -1,0 +1,194 @@
+---
+title: "Performance"
+description: "Understand how the gem stores tenant context, rewrites queries, and provides Citus-specific utilities for shard management."
+---
+
+## Thread-safe tenant storage
+
+The gem stores the current tenant in `MultiTenant::Current`, which is a subclass of `ActiveSupport::CurrentAttributes`:
+
+```ruby
+module MultiTenant
+  class Current < ::ActiveSupport::CurrentAttributes
+    attribute :tenant
+  end
+end
+```
+
+`ActiveSupport::CurrentAttributes` is automatically reset at the end of each request (or job), so tenant context never leaks between requests even in a threaded server like Puma. You do not need `RequestStore` or thread-local variables.
+
+The public API is a thin wrapper around `Current.tenant`:
+
+```ruby
+MultiTenant.current_tenant = account        # write
+MultiTenant.current_tenant                  # read
+MultiTenant.current_tenant_id               # read the id (works when tenant is an object or a raw id)
+```
+
+## Query rewriting vs default_scope
+
+Many multi-tenant gems use `default_scope` to inject tenant conditions. The problem with that approach is that `unscoped` removes the tenant filter, making it easy to accidentally expose cross-tenant data.
+
+`activerecord-multi-tenant` rewrites queries at the Arel level instead. A registry maps table names to their multi-tenant models:
+
+```ruby
+MultiTenant.register_multi_tenant_model(self)          # called inside `multi_tenant :account`
+MultiTenant.multi_tenant_model_for_table(table_name)   # used by the query rewriter
+```
+
+When a query is built and a tenant is active, the rewriter adds a `WHERE tenant_id = ?` condition directly to the Arel AST, before the SQL string is produced. This means `unscoped` does not strip the tenant filter, and the conditions compose correctly with joins and subqueries.
+
+<Tip>
+  Because filters are applied at the Arel level, you still need to call `MultiTenant.without { ... }` when you intentionally want to run a cross-tenant query (for example, in a background job that processes all tenants).
+</Tip>
+
+## Statement cache skipping
+
+Rails caches prepared statements for associations. Because the tenant condition is dynamic, the gem overrides `skip_statement_cache?` to return `true` for any association whose target class (or through-class) is scoped by tenant:
+
+```ruby
+module MultiTenant
+  module AssociationExtensions
+    def skip_statement_cache?(*scope)
+      return true if klass.respond_to?(:scoped_by_tenant?) && klass.scoped_by_tenant?
+
+      if reflection.through_reflection
+        through_klass = reflection.through_reflection.klass
+        return true if through_klass.respond_to?(:scoped_by_tenant?) && through_klass.scoped_by_tenant?
+      end
+
+      super
+    end
+  end
+end
+```
+
+This prevents Rails from reusing a cached statement that was prepared for a different tenant, which would return incorrect results.
+
+## `wrap_methods` — automatic tenant propagation
+
+`MultiTenant.wrap_methods` prepends a module onto a class and wraps each named method with a `MultiTenant.with(partition_key)` block. It activates only when:
+
+- The owner object belongs to a registered multi-tenant model.
+- The owner is persisted (has a `partition_key` value).
+- No tenant is currently set on the thread.
+
+```ruby
+# Applied at load time in model_extensions.rb
+
+# Wraps instance-level methods on ActiveRecord::Base
+MultiTenant.wrap_methods(ActiveRecord::Base, 'self', :delete, :reload, :update_columns)
+
+# Wraps the reload method on singular associations
+MultiTenant.wrap_methods(ActiveRecord::Associations::Association, 'owner', :reload)
+
+# Wraps collection proxy methods so traversal always includes tenant scope
+MultiTenant.wrap_methods(
+  ActiveRecord::Associations::CollectionProxy,
+  '@association.owner',
+  :find, :last, :take, :build, :create, :create!, :replace,
+  :delete_all, :destroy_all, :delete, :destroy, :calculate,
+  :pluck, :size, :empty?, :include?,
+  :records, :find_nth_with_limit, :find_nth_from_last,
+  :null_scope?, :find_from_target?, :exec_queries
+)
+```
+
+This ensures that calling `record.reload`, `record.delete`, or traversing an association on a persisted model always has the correct `tenant_id` in the `WHERE` clause, even when called outside an explicit `MultiTenant.with` block.
+
+## Citus migration helpers
+
+The gem extends `ActiveRecord::Migration` with helpers for Citus distributed tables.
+
+### `execute_on_all_nodes`
+
+Runs a SQL statement on the coordinator and then on every worker node. Useful for DDL that must be consistent across the cluster (such as creating extensions):
+
+```ruby
+def up
+  execute_on_all_nodes "CREATE EXTENSION IF NOT EXISTS pg_trgm"
+end
+```
+
+Internally it dispatches to the correct Citus function based on the detected version:
+
+- Citus 6.0: `citus_run_on_all_workers`
+- Citus 6.1+: `run_command_on_workers`
+- Plain PostgreSQL (no Citus): executes locally only
+
+A convenience wrapper is also available:
+
+```ruby
+enable_extension_on_all_nodes('pg_trgm')
+```
+
+### `rebalance_table_shards`
+
+After adding worker nodes or distributing new tables, call `rebalance_table_shards` inside a migration to move shards evenly across the cluster:
+
+```ruby
+def up
+  create_distributed_table :events, :account_id
+  rebalance_table_shards
+end
+```
+
+This calls `SELECT rebalance_table_shards()` on the coordinator. The method is a no-op when Citus is not installed, so the same migration works against a plain PostgreSQL database.
+
+<Note>
+  Shard rebalancing moves data between worker nodes and can take a long time for large tables. Run it during a maintenance window or use Citus's non-blocking rebalancer if your version supports it.
+</Note>
+
+## Performance tips
+
+<AccordionGroup>
+  <Accordion title="Index the partition key">
+    Every multi-tenant table should have an index on the partition key column. On Citus the partition key is already part of the composite primary key, but on plain PostgreSQL you must add it explicitly:
+
+    ```ruby
+    add_index :events, :account_id
+    ```
+
+    Without this index, every tenant-scoped query performs a full sequential scan.
+  </Accordion>
+  <Accordion title="Use composite primary keys">
+    On Citus, set up tables with a composite primary key that includes the partition key:
+
+    ```ruby
+    create_table :events, partition_key: :account_id do |t|
+      t.references :account, null: false
+      t.string :name
+      t.timestamps
+    end
+    ```
+
+    Passing `partition_key:` to `create_table` automatically drops the default single-column primary key and replaces it with `PRIMARY KEY (account_id, id)`. This keeps Citus's shard-pruning effective.
+  </Accordion>
+  <Accordion title="Prefer `MultiTenant.with` over raw ID assignment">
+    Setting the tenant through `MultiTenant.with(account)` stores the full object and lets the gem return it from the association cache without a database round-trip:
+
+    ```ruby
+    # Avoids a SELECT when accessing post.account inside the block
+    MultiTenant.with(account) do
+      Post.create!(title: "Hello")
+    end
+    ```
+
+    When you set the tenant to a raw integer ID instead, the gem still applies the correct `WHERE` clause, but loading the association triggers a database query.
+  </Accordion>
+  <Accordion title="Use `MultiTenant.without` for cross-tenant background jobs">
+    Jobs that process data across all tenants should use `MultiTenant.without` to prevent accidental tenant scoping:
+
+    ```ruby
+    class DailyReportJob < ApplicationJob
+      def perform
+        MultiTenant.without do
+          Account.find_each do |account|
+            MultiTenant.with(account) { generate_report(account) }
+          end
+        end
+      end
+    end
+    ```
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,55 @@
+---
+title: "Introduction"
+description: "ActiveRecord/Rails integration for multi-tenant distributed databases, with native support for the Citus extension for PostgreSQL."
+---
+
+`activerecord-multi-tenant` is a Ruby gem that makes it straightforward to build multi-tenant Rails applications on distributed databases. It automatically scopes your ActiveRecord queries to the current tenant, ensuring data isolation and enabling the database to efficiently route queries to the right node.
+
+## The problem it solves
+
+When you run a SaaS application on a distributed database like [Citus](https://github.com/citusdata/citus), every query must include the tenant's partition key so the database can route it to the correct shard. Without tooling, you would need to manually add `WHERE customer_id = ?` to every SELECT, UPDATE, and DELETE — across every model, every association, and every background job. That is error-prone, tedious, and easy to get wrong.
+
+`activerecord-multi-tenant` solves this at the framework level:
+
+- It **automatically injects the tenant scope** into all queries once you declare `multi_tenant :customer` on a model.
+- It provides **`MultiTenant.with(tenant) { }`** to scope any block of code to a specific tenant.
+- It provides **controller helpers** (`set_current_tenant_through_filter`, `set_current_tenant`) to set the tenant for the duration of a web request.
+- It **preserves tenant context** across association traversals, reloads, and collection proxy operations.
+
+## Key concepts
+
+**Tenant model** — The ActiveRecord model that represents an account or organization (for example, `Customer`). Other models declare their relationship to it using `multi_tenant :customer`.
+
+**Partition key** — The foreign key column that links a record to its tenant (for example, `customer_id`). This is what Citus uses to route queries to the correct shard. The gem derives the partition key from the tenant name by convention, but you can override it.
+
+**Tenant scoping** — When a current tenant is set (via `MultiTenant.with` or `set_current_tenant`), the gem automatically appends `WHERE customer_id = <current_id>` to all queries on scoped models. New records are also automatically stamped with the current tenant's ID.
+
+**Write-only mode** — A migration path for existing applications. In write-only mode the gem stamps new records with the tenant ID but does not add the tenant scope to reads. This lets you backfill existing rows before enforcing the constraint.
+
+## Requirements
+
+| Dependency | Minimum version |
+|------------|-----------------|
+| Ruby       | 3.0.0           |
+| Rails      | 6.0             |
+
+<Note>
+  This gem supports ActiveRecord only. Alternative ORMs such as Sequel are not supported.
+</Note>
+
+## Explore the docs
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get a multi-tenant model and controller working in minutes.
+  </Card>
+  <Card title="Multi-tenancy concepts" icon="building" href="/concepts/multi-tenancy">
+    Understand how distributed multi-tenancy works with Citus.
+  </Card>
+  <Card title="Tenant scoping" icon="shield" href="/concepts/tenant-scoping">
+    Learn how the gem scopes queries and stamps new records.
+  </Card>
+  <Card title="Model setup" icon="database" href="/guides/model-setup">
+    Annotate your models and configure associations correctly.
+  </Card>
+</CardGroup>

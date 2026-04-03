@@ -1,0 +1,128 @@
+---
+title: "Multi-tenancy"
+description: "Understand how activerecord-multi-tenant implements tenant isolation in Rails apps backed by PostgreSQL and Citus."
+---
+
+Multi-tenancy is an architecture where a single application instance serves multiple independent customers — called **tenants** — while keeping their data isolated from one another. `activerecord-multi-tenant` implements this pattern in Rails using a **shared database, shared schema** approach: all tenants live in the same tables, and isolation is enforced at the query level by filtering on a **partition key**.
+
+## The shared database, shared schema approach
+
+Rather than giving each tenant a separate database or schema, all tenant data coexists in the same tables. A column on every tenant-owned table — the partition key — identifies which tenant each row belongs to.
+
+```
+customers table
+┌─────┬──────────────┐
+│ id  │ name         │
+├─────┼──────────────┤
+│  1  │ Acme Corp    │
+│  2  │ Globex Inc   │
+└─────┴──────────────┘
+
+sites table
+┌─────┬─────────────────┬─────────────┐
+│ id  │ domain          │ customer_id │
+├─────┼─────────────────┼─────────────┤
+│ 10  │ acme.example    │      1      │
+│ 11  │ globex.example  │      2      │
+└─────┴─────────────────┴─────────────┘
+
+page_views table
+┌─────┬─────────┬─────────────┐
+│ id  │ site_id │ customer_id │
+├─────┼─────────┼─────────────┤
+│ 100 │  10     │      1      │
+│ 101 │  11     │      2      │
+└─────┴─────────┴─────────────┘
+```
+
+The gem automatically adds `WHERE customer_id = ?` to every query once you declare a model's tenant relationship, so no tenant ever sees another tenant's rows.
+
+## What is Citus, and why does it matter?
+
+[Citus](https://github.com/citusdata/citus) is an open-source PostgreSQL extension that turns a single Postgres node into a distributed database by horizontally sharding tables across multiple worker nodes. Each table is sharded on a **distribution column** — which maps directly to the partition key used by this gem.
+
+When every query includes the partition key in its `WHERE` clause, Citus can route the query to exactly the one shard that holds that tenant's data, rather than broadcasting it to every worker. This is what makes Citus-backed multi-tenant apps scale horizontally while preserving full SQL semantics.
+
+```
+                  ┌──────────────────────┐
+  Rails app  ───► │  Citus coordinator   │
+                  └──────────┬───────────┘
+                             │  WHERE customer_id = 1
+                  ┌──────────▼───────────┐
+                  │  Worker node for     │
+                  │  customer_id = 1     │
+                  └──────────────────────┘
+```
+
+<Note>
+You don't need Citus to use this gem. It works with standard PostgreSQL too, where the partition key acts purely as a tenant-scoping filter rather than a sharding key.
+</Note>
+
+## The tenant model
+
+One model in your application acts as the **root of tenancy**. This is typically the top-level entity that owns all other data — a `Customer`, `Account`, or `Organization`. Every other model declares its relationship to the tenant model using `multi_tenant`.
+
+```ruby
+# The tenant model itself — no multi_tenant declaration needed
+class Customer < ActiveRecord::Base
+  has_many :sites
+  has_many :page_views
+end
+
+# Models owned by a tenant declare their relationship
+class Site < ActiveRecord::Base
+  multi_tenant :customer
+  has_many :page_views
+end
+
+class PageView < ActiveRecord::Base
+  multi_tenant :customer
+  belongs_to :site
+end
+```
+
+When you call `multi_tenant :customer` on a model, the gem:
+
+1. Sets `customer_id` as the **partition key** for that model (derived automatically from the tenant name as `#{tenant_name}_id`).
+2. Registers the model in an internal table-to-model registry used by the query rewriter.
+3. Creates an implicit `belongs_to :customer` association (if the `Customer` class exists).
+4. Automatically sets `customer_id` on new records when a tenant context is active.
+5. Raises `MultiTenant::TenantIsImmutable` if code attempts to reassign a persisted record to a different tenant.
+
+## How data is organized
+
+All rows belonging to a tenant share the same partition key value. Given an analytics app sharding on `customer_id`:
+
+```ruby
+MultiTenant.with(Customer.find(1)) do
+  # All of these records share customer_id = 1
+  site      = Site.create!(domain: "acme.example")   # customer_id: 1
+  page_view = site.page_views.create!(path: "/home") # customer_id: 1
+end
+```
+
+Because the gem injects the `customer_id` condition at the Arel level — not just as a Rails scope — even raw `UPDATE` and `DELETE` statements issued through ActiveRecord carry the tenant constraint. This prevents cross-tenant data mutation even when callbacks are bypassed via `update_columns`.
+
+## Tables that don't belong to a tenant
+
+Some tables hold data shared across all tenants, such as lookup tables or plan templates. For these, simply don't call `multi_tenant` on the model — the gem leaves them completely unscoped.
+
+If a table contains a mix of tenant-specific rows and shared rows, use `customer_id = 0` as a sentinel for shared records and access them with `MultiTenant.with(0)`.
+
+```ruby
+# Shared template accessible to every tenant
+MultiTenant.with(0) do
+  ReportTemplate.find_by(name: "Monthly Summary")
+end
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Tenant scoping" icon="filter" href="/concepts/tenant-scoping">
+    Learn how the gem injects tenant conditions into queries and how to manage tenant context in your code.
+  </Card>
+  <Card title="Write-only mode" icon="pen" href="/concepts/write-only-mode">
+    Roll out multi-tenancy to an existing app without downtime using write-only mode.
+  </Card>
+</CardGroup>

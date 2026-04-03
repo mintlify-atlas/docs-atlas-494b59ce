@@ -1,0 +1,96 @@
+---
+title: "Associations"
+description: "How has_many, has_one, belongs_to, and has_and_belongs_to_many work across tenant-scoped models."
+---
+
+## Standard associations
+
+When both sides of an association have `multi_tenant` declared, Rails associations work without any changes. The gem automatically scopes collection queries to the current tenant:
+
+```ruby
+class User < ActiveRecord::Base
+  multi_tenant :company
+  has_many :posts
+end
+
+class Post < ActiveRecord::Base
+  multi_tenant :company
+  belongs_to :user
+end
+
+MultiTenant.with(Company.first) do
+  user = User.first
+  user.posts  # SELECT ... WHERE company_id = ? AND user_id = ?
+end
+```
+
+You do not need to add a `-> { where(company_id: ...) }` scope yourself. The query rewriter injects the tenant condition for any model that has `multi_tenant` declared.
+
+## `has_many`, `has_one`, and `belongs_to`
+
+These associations all work automatically. The example from the RST docs illustrates `has_many` and `has_one` together:
+
+```ruby
+class Account < ActiveRecord::Base
+  multi_tenant :account
+  has_many :projects
+  has_one :manager, inverse_of: :account
+end
+
+class Manager < ActiveRecord::Base
+  multi_tenant :account
+  belongs_to :project
+end
+```
+
+### Using `inverse_of`
+
+Use `inverse_of` to help Rails link the two sides of an association in memory without an extra query. Pass it directly on `multi_tenant` or on the association declaration:
+
+```ruby
+class Account < ActiveRecord::Base
+  multi_tenant :account
+  has_one :manager, inverse_of: :account
+end
+
+class Manager < ActiveRecord::Base
+  multi_tenant :account, inverse_of: :manager  # forwarded to the implicit belongs_to
+  belongs_to :account, inverse_of: :manager
+end
+```
+
+## `has_and_belongs_to_many` associations
+
+`has_and_belongs_to_many` requires extra options to propagate the tenant ID to the join table. Set `tenant_enabled: true` together with `tenant_column` and `tenant_class_name`:
+
+```ruby
+class Manager < ActiveRecord::Base
+  multi_tenant :account
+  belongs_to :project
+  has_and_belongs_to_many :tasks,
+    tenant_column: :account_id,
+    tenant_enabled: true,
+    tenant_class_name: 'Account'
+end
+```
+
+When `tenant_enabled` is `true`, the gem patches the join model to:
+
+1. Add a `belongs_to` for the tenant on the join table.
+2. Register a `before_create` callback that sets the tenant column from `MultiTenant.current_tenant_id`.
+3. Raise `MultiTenant::MissingTenantError` if no tenant is set when the join record is created.
+
+Example usage:
+
+```ruby
+MultiTenant.with(account1) do
+  manager1 = Manager.create!(name: 'manager1', account: account1, tasks: [task1])
+  manager1.tasks.first.account_id == task1.account_id  # => true
+end
+```
+
+The option `tenant_enabled: false` (the default) leaves the join table untouched and is equivalent to a standard `has_and_belongs_to_many`.
+
+<Note>
+Some tables in your application may not relate to any tenant — shared lookup tables, feature flags, or global configuration records. Do not add `multi_tenant` to these models. If a single table contains both tenant-owned records and shared records, set `tenant_id` to `0` on the shared rows and access them with `MultiTenant.with(0) { ... }`. Avoid mixing scoped and unscoped queries on the same model class.
+</Note>

@@ -1,0 +1,65 @@
+---
+title: "Installation"
+description: "Add activerecord-multi-tenant to your Ruby on Rails application."
+---
+
+## Requirements
+
+Before installing, confirm your environment meets the minimum versions:
+
+| Dependency | Minimum version |
+|------------|-----------------|
+| Ruby       | 3.0.0           |
+| Rails      | 6.0             |
+
+<Note>
+  This gem supports ActiveRecord only — the default ORM that ships with Rails. Alternative ORMs such as Sequel are not supported.
+</Note>
+
+## Add the gem
+
+Add `activerecord-multi-tenant` to your `Gemfile`:
+
+```ruby Gemfile
+gem 'activerecord-multi-tenant'
+```
+
+Then run:
+
+```bash
+bundle install
+```
+
+The gem hooks into Rails automatically via `ActiveSupport.on_load` callbacks — no initializer or `require` statement is needed.
+
+## Verify the installation
+
+Start a Rails console and confirm the gem is available:
+
+```bash
+bin/rails console
+```
+
+```ruby
+MultiTenant::VERSION  # => "2.4.0"
+```
+
+You can also confirm that the `multi_tenant` class method has been added to your models:
+
+```ruby
+ApplicationRecord.respond_to?(:multi_tenant)  # => true
+```
+
+If both return without error, the gem is installed and active.
+
+## What gets loaded
+
+When the gem loads it registers extensions on:
+
+- **`ActiveRecord::Base`** — adds the `multi_tenant` class method and wraps `delete`, `reload`, and `update_columns` to include the tenant scope.
+- **`ActionController::Base`** — adds `set_current_tenant_through_filter`, `set_current_tenant`, and `current_tenant` when ActionController is present.
+- **`ActiveRecord::Associations`** — ensures association queries and collection proxy operations respect the current tenant.
+
+<Tip>
+  If you are adding the gem to an existing application with existing rows, read the [rolling out guide](/guides/rolling-out) before annotating your models. You will want to use write-only mode while backfilling the `customer_id` column.
+</Tip>

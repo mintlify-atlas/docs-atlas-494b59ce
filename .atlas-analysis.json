@@ -1,0 +1,97 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "activerecord-multi-tenant",
+  "projectDescription": "A Ruby gem providing ActiveRecord/Rails integration for distributed multi-tenant databases, with native support for the Citus extension for PostgreSQL.",
+  "theme": "luma",
+  "primaryColor": "#f41c7c",
+  "lightColor": "#1c1434",
+  "darkColor": "#fc7cbc",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/multi-tenancy",
+              "concepts/tenant-scoping",
+              "concepts/write-only-mode"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/model-setup",
+              "guides/controller-integration",
+              "guides/associations",
+              "guides/background-jobs",
+              "guides/migrations",
+              "guides/rolling-out"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/query-monitor",
+              "advanced/bulk-operations",
+              "advanced/performance"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/api",
+              "reference/configuration",
+              "reference/troubleshooting",
+              "reference/changelog"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Automatic tenant scoping of ActiveRecord queries using partition keys",
+    "Controller integration via set_current_tenant_through_filter and before_action",
+    "Write-only mode for incremental migration to multi-tenancy",
+    "Migration helpers for Citus distributed and reference tables",
+    "Sidekiq middleware for tenant context propagation in background jobs",
+    "has_and_belongs_to_many support with tenant scoping",
+    "Query monitor for detecting missing tenant context",
+    "Bulk data insertion via copy_from_client (PostgreSQL COPY command)",
+    "Thread-safe tenant context using ActiveSupport::CurrentAttributes"
+  ],
+  "publicApiSurface": [
+    "multi_tenant :tenant_name (model macro)",
+    "MultiTenant.with(tenant) { }",
+    "MultiTenant.without { }",
+    "MultiTenant.current_tenant",
+    "MultiTenant.current_tenant=",
+    "MultiTenant.current_tenant_id",
+    "MultiTenant.enable_write_only_mode",
+    "MultiTenant.enable_query_monitor",
+    "MultiTenant.load_current_tenant!",
+    "MultiTenant.wrap_methods",
+    "set_current_tenant_through_filter (controller macro)",
+    "set_current_tenant(tenant) (controller helper)",
+    "create_distributed_table(table_name, partition_key) (migration helper)",
+    "create_reference_table(table_name) (migration helper)",
+    "undistribute_table(table_name) (migration helper)",
+    "rebalance_table_shards (migration helper)",
+    "execute_on_all_nodes(sql) (migration helper)",
+    "copy_from_client(columns) { } (model method)",
+    "MultiTenant::FastTruncate.run",
+    "Sidekiq::Middleware::MultiTenant::Client",
+    "Sidekiq::Middleware::MultiTenant::Server",
+    "Sidekiq::Client#push_bulk_with_tenants"
+  ]
+}

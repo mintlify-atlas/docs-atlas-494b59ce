@@ -1,0 +1,174 @@
+---
+title: "Tenant scoping"
+description: "How activerecord-multi-tenant automatically injects tenant conditions into every query, and how to manage tenant context in your application."
+---
+
+Tenant scoping is the mechanism by which the gem ensures that every `SELECT`, `INSERT`, `UPDATE`, and `DELETE` statement is automatically constrained to the current tenant. You don't write `WHERE customer_id = ?` by hand — the gem rewrites the Arel AST before the query reaches the database.
+
+## How the query rewriter works
+
+When you build an ActiveRecord query on a model that has called `multi_tenant`, the gem's `QueryMethodsExtensions` module intercepts `build_arel`. It walks the Arel syntax tree using `ArelTenantVisitor`, identifies every table that belongs to a multi-tenant model (via the table-name registry), and injects a `TenantEnforcementClause` wherever a tenant condition is missing.
+
+For `UPDATE` and `DELETE` statements, tenant conditions are injected at the database adapter level via `DatabaseStatements`, so even `update_columns` and low-level deletes carry the constraint. The `ActiveRecord::Relation` is also patched so that `update_all` and `delete_all` generate a subquery-based `WHERE IN (...)` condition scoped to the current tenant.
+
+For joins between two multi-tenant tables, the gem also adds a `TenantJoinEnforcementClause` ensuring the join condition includes the partition key from both sides — which Citus requires for co-located joins to stay on a single worker node.
+
+## Setting the tenant context
+
+### Using a block with `MultiTenant.with`
+
+The recommended way to set the tenant context is with a block. The context is automatically restored when the block exits, even if an exception is raised.
+
+```ruby
+customer = Customer.find(session[:current_customer_id])
+
+MultiTenant.with(customer) do
+  site = Site.find(params[:site_id])
+  site.update!(last_accessed_at: Time.now)
+  site.page_views.count
+end
+```
+
+You can pass either a model instance or a raw ID:
+
+```ruby
+# Pass a model instance
+MultiTenant.with(customer) { ... }
+
+# Pass a raw integer ID — useful when you only have an ID, not a loaded record
+MultiTenant.with(42) { ... }
+
+# Pass a string ID (e.g., from a UUID column)
+MultiTenant.with("a1b2c3d4") { ... }
+```
+
+<Note>
+When you pass a raw ID, `MultiTenant.current_tenant_is_id?` returns `true`. The gem uses the raw value directly as the partition key in SQL. If you later need to load the full tenant record, set `MultiTenant.default_tenant_class` and call `MultiTenant.load_current_tenant!`.
+</Note>
+
+### Setting the tenant in a controller
+
+For web requests, use `set_current_tenant` inside a `before_action`. You must first call `set_current_tenant_through_filter` to opt into this behavior:
+
+```ruby
+class ApplicationController < ActionController::Base
+  set_current_tenant_through_filter
+  before_action :set_customer_as_tenant
+
+  def set_customer_as_tenant
+    customer = Customer.find(session[:current_customer_id])
+    set_current_tenant(customer)
+  end
+end
+```
+
+This sets the tenant for the entire request via `ActiveSupport::CurrentAttributes`, which is automatically reset at the end of each request.
+
+### Setting the tenant directly
+
+You can also assign the current tenant without a block:
+
+```ruby
+MultiTenant.current_tenant = customer
+```
+
+<Warning>
+Without a block, you are responsible for resetting `MultiTenant.current_tenant` yourself. Leaving it set between requests or background jobs can cause data leaks across tenants.
+</Warning>
+
+## Inspecting the current tenant context
+
+The gem provides several methods for reading the current tenant state:
+
+```ruby
+# Returns the value passed to MultiTenant.with — either a model instance or a raw ID
+MultiTenant.current_tenant
+# => #<Customer id: 1, name: "Acme Corp">
+
+# Returns just the ID regardless of whether a model instance or raw ID was passed
+MultiTenant.current_tenant_id
+# => 1
+
+# Returns true when a raw ID (String or Integer) was passed instead of a model instance
+MultiTenant.current_tenant_is_id?
+# => false
+```
+
+These are useful in callbacks, service objects, or anywhere you need to read — but not change — the active tenant.
+
+## Removing the tenant scope temporarily
+
+Use `MultiTenant.without` to execute code outside any tenant context. The previous tenant is restored when the block exits.
+
+```ruby
+MultiTenant.without do
+  # No WHERE customer_id = ? clause is added here
+  Customer.all.each { |c| puts c.name }
+end
+```
+
+<Warning>
+`MultiTenant.without` bypasses all tenant isolation. Use it only for administrative tasks such as running cross-tenant reports or maintenance jobs. Never expose its results directly to end users.
+</Warning>
+
+## The partition key
+
+By default, the partition key for a model is derived from the tenant name: `#{tenant_name}_id`. For a `multi_tenant :customer` declaration this becomes `customer_id`.
+
+You can override it with the `partition_key` option:
+
+```ruby
+class PageView < ActiveRecord::Base
+  # Uses "account_id" as the partition key instead of "customer_id"
+  multi_tenant :customer, partition_key: "account_id"
+end
+```
+
+You can read the partition key for any multi-tenant model:
+
+```ruby
+PageView.partition_key
+# => "customer_id"
+```
+
+The partition key is what the query rewriter looks for when deciding whether a table already has a tenant condition. If the `WHERE` clause already contains `customer_id = ?`, no additional clause is injected.
+
+## Tenant immutability
+
+Once a record is saved, its partition key cannot be changed. Attempting to do so raises `MultiTenant::TenantIsImmutable`:
+
+```ruby
+page_view = PageView.first
+# => #<PageView id: 100, customer_id: 1, ...>
+
+page_view.customer_id = 2
+# => raises MultiTenant::TenantIsImmutable
+
+page_view.customer = Customer.find(2)
+# => raises MultiTenant::TenantIsImmutable
+```
+
+This constraint exists because Citus distributes data by the partition key at write time. Moving a row to a different shard after the fact requires the row to be deleted and re-inserted, which is not supported transparently by the database.
+
+## Automatic tenant assignment on new records
+
+When a tenant context is active, new records are automatically stamped with the current tenant's ID via an `after_initialize` callback:
+
+```ruby
+MultiTenant.with(customer) do
+  site = Site.new(domain: "acme.example")
+  site.customer_id
+  # => 1 — set automatically, no manual assignment needed
+end
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Controller integration" icon="server" href="/guides/controller-integration">
+    Set up tenant context for every request using before_action.
+  </Card>
+  <Card title="Write-only mode" icon="pen" href="/concepts/write-only-mode">
+    Migrate an existing app to multi-tenancy without breaking existing queries.
+  </Card>
+</CardGroup>

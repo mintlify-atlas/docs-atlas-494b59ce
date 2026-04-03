@@ -1,0 +1,126 @@
+---
+title: "Migrations"
+description: "Migration helpers for distributing tables, creating reference tables, and managing Citus-specific schema operations."
+---
+
+## Overview
+
+`activerecord-multi-tenant` extends `ActiveRecord::Migration` with helpers for Citus-specific DDL. All helpers check for a live Citus installation before executing; if Citus is not present they are no-ops, so your migrations run unchanged on plain PostgreSQL (development, CI, etc.).
+
+## Distributing a table
+
+Call `create_distributed_table` to distribute a table by a partition key. This tells Citus which column to use for shard routing:
+
+```ruby
+class DistributePageViews < ActiveRecord::Migration[7.0]
+  def change
+    create_distributed_table :page_views, :customer_id
+  end
+end
+```
+
+The helper is **reversible**: rolling back the migration calls `undistribute_table` automatically.
+
+## Creating a reference table
+
+Reference tables are replicated to every Citus worker node, making them useful for shared lookup data that needs to join with distributed tables:
+
+```ruby
+class CreatePlanTypes < ActiveRecord::Migration[7.0]
+  def change
+    create_table :plan_types do |t|
+      t.string :name
+    end
+
+    create_reference_table :plan_types
+  end
+end
+```
+
+Rolling back also calls `undistribute_table`.
+
+## Undistributing a table
+
+Revert a distributed or reference table back to a regular local table:
+
+```ruby
+class UndistributeOldTable < ActiveRecord::Migration[7.0]
+  def up
+    undistribute_table :legacy_events
+  end
+end
+```
+
+Note that `undistribute_table` is not automatically reversible — wrap it in `up`/`down` methods if you need to reverse it.
+
+## Rebalancing shards
+
+After adding worker nodes, rebalance existing shards across the cluster:
+
+```ruby
+class RebalanceShards < ActiveRecord::Migration[7.0]
+  def up
+    rebalance_table_shards
+  end
+end
+```
+
+## Running SQL on all nodes
+
+`execute_on_all_nodes` runs a SQL statement on the coordinator and on every worker node. This is useful for DDL that must be present everywhere, such as installing extensions:
+
+```ruby
+class AddUuidExtension < ActiveRecord::Migration[7.0]
+  def up
+    execute_on_all_nodes 'CREATE EXTENSION IF NOT EXISTS "uuid-ossp"'
+  end
+end
+```
+
+For the common case of installing an extension, use the convenience wrapper:
+
+```ruby
+class AddUuidExtension < ActiveRecord::Migration[7.0]
+  def up
+    enable_extension_on_all_nodes 'uuid-ossp'
+  end
+end
+```
+
+## Composite primary keys with `partition_key:`
+
+When you create a distributed table, Citus requires the partition key column to be part of the primary key. Pass `partition_key:` to `create_table` and the gem alters the primary key for you:
+
+```ruby
+class CreatePageViews < ActiveRecord::Migration[7.0]
+  def change
+    create_table :page_views, partition_key: :customer_id do |t|
+      t.bigint  :customer_id, null: false
+      t.bigint  :site_id,     null: false
+      t.timestamps
+    end
+
+    create_distributed_table :page_views, :customer_id
+  end
+end
+```
+
+Internally the gem drops the single-column `id` primary key and recreates it as `PRIMARY KEY (customer_id, id)`.
+
+## Schema dumper support
+
+The gem patches `ActiveRecord::SchemaDumper` to preserve distribution metadata. When you run `db:schema:dump`, distributed and reference tables appear in `schema.rb`:
+
+```ruby
+create_table "page_views", force: :cascade do |t|
+  # ...
+end
+create_distributed_table("page_views", "customer_id")
+
+create_table "plan_types", force: :cascade do |t|
+  # ...
+end
+create_reference_table("plan_types")
+```
+
+This means `db:schema:load` and `db:reset` correctly recreate the distribution when Citus is present.

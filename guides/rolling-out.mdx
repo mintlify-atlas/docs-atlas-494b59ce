@@ -1,0 +1,119 @@
+---
+title: "Rolling out to an existing app"
+description: "A step-by-step process for adding multi-tenancy to a Rails application that already has production data."
+---
+
+## Overview
+
+Adding `multi_tenant` to an existing application requires care because the gem expects `tenant_id` to be `NOT NULL` for all rows. Write-only mode lets you introduce the gem incrementally: new records get a tenant ID immediately while you backfill existing data in the background.
+
+<Warning>
+Write-only mode is temporary. It prevents the gem from filtering queries by tenant, so all records remain visible regardless of the current tenant. Remove it as soon as you have backfilled all rows and added a `NOT NULL` constraint.
+</Warning>
+
+<Steps>
+  <Step title="Enable write-only mode">
+    Create an initializer that enables write-only mode before any models are loaded:
+
+    ```ruby
+    # config/initializers/multi_tenant.rb
+    MultiTenant.enable_write_only_mode
+    ```
+
+    In this mode the gem sets `tenant_id` on new records but does not include it in `SELECT`, `UPDATE`, or `DELETE` queries. Your existing queries continue to return all records while you migrate.
+  </Step>
+
+  <Step title="Annotate your models">
+    Add `multi_tenant` to every model that belongs to a tenant. Start with the models that have the most queries and work outward:
+
+    ```ruby
+    class PageView < ActiveRecord::Base
+      multi_tenant :customer
+      belongs_to :site
+    end
+
+    class Site < ActiveRecord::Base
+      multi_tenant :customer
+      has_many :page_views
+    end
+    ```
+
+    Deploy this change with write-only mode still active. New records created after this deploy will have `customer_id` set automatically.
+  </Step>
+
+  <Step title="Backfill tenant_id for existing records">
+    Write a migration or background job to populate `tenant_id` on rows that were created before the gem was introduced. The exact query depends on how your data model relates records to tenants.
+
+    Example migration to backfill through a join:
+
+    ```ruby
+    class BackfillPageViewCustomerId < ActiveRecord::Migration[7.0]
+      def up
+        # Example: derive customer_id from the associated site
+        execute <<~SQL
+          UPDATE page_views
+          SET    customer_id = sites.customer_id
+          FROM   sites
+          WHERE  page_views.site_id = sites.id
+            AND  page_views.customer_id IS NULL
+        SQL
+      end
+    end
+    ```
+
+    For large tables, backfill in batches to avoid locking:
+
+    ```ruby
+    PageView.in_batches(of: 1000) do |batch|
+      batch.where(customer_id: nil).update_all(
+        'customer_id = (SELECT customer_id FROM sites WHERE sites.id = page_views.site_id)'
+      )
+    end
+    ```
+
+    If you have enabled the query monitor (`MultiTenant.enable_query_monitor`), it logs a warning whenever a query raises an exception without a tenant being set. Use its output to find models you may have missed.
+  </Step>
+
+  <Step title="Add a NOT NULL constraint">
+    Once you have verified that all rows have a `customer_id` value, add the database constraint:
+
+    ```ruby
+    class EnforcePageViewCustomerIdNotNull < ActiveRecord::Migration[7.0]
+      def change
+        change_column_null :page_views, :customer_id, false
+      end
+    end
+    ```
+
+    Run this migration and confirm there are no `NULL` values before proceeding.
+  </Step>
+
+  <Step title="Remove write-only mode">
+    Delete the `enable_write_only_mode` call from your initializer:
+
+    ```ruby
+    # config/initializers/multi_tenant.rb
+    # Remove or comment out the line below:
+    # MultiTenant.enable_write_only_mode
+    ```
+
+    Deploy the change. From this point on the gem enforces full tenant scoping: every query includes a `WHERE customer_id = ?` condition, and attempting to change `customer_id` on a persisted record raises `MultiTenant::TenantIsImmutable`.
+  </Step>
+</Steps>
+
+## Using the query monitor as a safety net
+
+The gem includes an opt-in query monitor that logs a warning when a query raises an exception while no tenant is set. Enable it during your rollout to surface code paths that are not yet tenant-aware:
+
+```ruby
+# config/initializers/multi_tenant.rb
+MultiTenant.enable_query_monitor
+```
+
+When active, failed queries with no tenant context produce a `Rails.logger.info` entry:
+
+```
+WARNING: Tenant not present - make sure to add MultiTenant.with(tenant) { ... }
+```
+
+Check your logs for these warnings to find any remaining unscoped call sites before you enforce `NOT NULL` and remove write-only mode. See the [query monitor guide](/advanced/query-monitor) for full details.

@@ -1,80 +1,120 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Add multi-tenant query scoping to a Rails application in four steps."
 ---
 
-## Get started in three steps
+This guide walks you through the minimum setup needed to have `activerecord-multi-tenant` scoping queries in your Rails application. The example uses a `Customer` tenant and a `Site` model that belongs to a customer.
 
-Get your documentation site running locally and make your first customization.
+<Steps>
+  <Step title="Install the gem">
+    Add the gem to your `Gemfile`:
 
-### Step 1: Set up your local environment
+    ```ruby Gemfile
+    gem 'activerecord-multi-tenant'
+    ```
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+    Then install it:
 
-### Step 2: Deploy your changes
+    ```bash
+    bundle install
+    ```
+  </Step>
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+  <Step title="Annotate your models">
+    Call `multi_tenant` with the name of your tenant model inside every ActiveRecord model that belongs to a tenant. Use the singular, underscored name of the tenant model as the argument.
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    ```ruby app/models/site.rb
+    class Site < ActiveRecord::Base
+      multi_tenant :customer
+      has_many :page_views
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+      # ...
+    end
+    ```
 
-### Step 3: Go live
+    ```ruby app/models/page_view.rb
+    class PageView < ActiveRecord::Base
+      multi_tenant :customer
+      belongs_to :site
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+      # ...
+    end
+    ```
+
+    Once a model declares `multi_tenant :customer`, the gem:
+
+    - Adds a `customer_id` partition key to the model.
+    - Automatically stamps new records with the current tenant's ID.
+    - Appends `WHERE customer_id = ?` to all queries when a tenant is set.
+    - Raises `MultiTenant::TenantIsImmutable` if you attempt to change the tenant of a persisted record.
+  </Step>
+
+  <Step title="Set the tenant per request">
+    In your `ApplicationController`, opt in to the filter-based tenant helper and set the current tenant in a `before_action`:
+
+    ```ruby app/controllers/application_controller.rb
+    class ApplicationController < ActionController::Base
+      set_current_tenant_through_filter # required to opt in
+      before_action :set_customer_as_tenant
+
+      private
+
+      def set_customer_as_tenant
+        customer = Customer.find(session[:current_customer_id])
+        set_current_tenant(customer)
+      end
+    end
+    ```
+
+    After this, every request automatically has the correct tenant scope. All queries in controllers, views, and helpers will be filtered to the current customer.
+  </Step>
+
+  <Step title="Scope code outside of requests">
+    For code that runs outside of a web request — such as Rake tasks, scripts, or background jobs — use `MultiTenant.with` to set the tenant for the duration of a block:
+
+    ```ruby
+    customer = Customer.find(session[:current_customer_id])
+
+    MultiTenant.with(customer) do
+      site = Site.find(params[:site_id])
+      site.update!(last_accessed_at: Time.now)
+      site.page_views.count
+    end
+    ```
+
+    You can also pass a raw ID instead of a model instance:
+
+    ```ruby
+    MultiTenant.with(42) do
+      Site.all # => SELECT * FROM sites WHERE customer_id = 42
+    end
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  **Migrating an existing application?** If your database already has rows without a `customer_id`, enable write-only mode first. In this mode the gem stamps the tenant ID on new records but does not add the tenant scope to reads, giving you time to backfill existing rows.
+
+  ```ruby config/initializers/multi_tenant.rb
+  MultiTenant.enable_write_only_mode
+  ```
+
+  Once all rows have a `customer_id` and you have made the column `NOT NULL`, remove that line. See the [rolling out guide](/guides/rolling-out) for the full migration strategy.
+</Note>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Model setup" icon="database" href="/guides/model-setup">
+    Configure associations, custom partition keys, and inherited models.
+  </Card>
+  <Card title="Controller integration" icon="server" href="/guides/controller-integration">
+    Learn all the ways to set and retrieve the current tenant in a request.
+  </Card>
+  <Card title="Background jobs" icon="clock" href="/guides/background-jobs">
+    Preserve tenant context in Sidekiq workers and other async jobs.
+  </Card>
+  <Card title="Write-only mode" icon="pencil" href="/concepts/write-only-mode">
+    Understand the incremental rollout path for existing applications.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

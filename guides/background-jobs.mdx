@@ -1,0 +1,88 @@
+---
+title: "Background jobs"
+description: "Propagate tenant context into Sidekiq workers automatically using the built-in middleware."
+---
+
+## Sidekiq middleware
+
+The gem ships optional Sidekiq middleware that serialises the current tenant into the job payload when a job is enqueued, and restores it when the job runs. Require the integration file to activate it:
+
+```ruby
+require 'activerecord-multi-tenant/sidekiq'
+```
+
+<Note>
+Require this file before Sidekiq starts processing. The typical place is an initializer, for example `config/initializers/multi_tenant_sidekiq.rb`, or at the top of your `Sidekiq.configure_server` block.
+</Note>
+
+## How the middleware is registered
+
+Requiring the file registers both the client and server middleware automatically:
+
+```ruby
+Sidekiq.configure_server do |config|
+  config.server_middleware do |chain|
+    chain.add Sidekiq::Middleware::MultiTenant::Server
+  end
+  config.client_middleware do |chain|
+    chain.add Sidekiq::Middleware::MultiTenant::Client
+  end
+end
+
+Sidekiq.configure_client do |config|
+  config.client_middleware do |chain|
+    chain.add Sidekiq::Middleware::MultiTenant::Client
+  end
+end
+```
+
+You do not need to add these lines yourself — they run when the file is required.
+
+## Client middleware
+
+`Sidekiq::Middleware::MultiTenant::Client` runs when a job is pushed to Redis. If `MultiTenant.current_tenant` is set, it embeds the tenant class name and ID in the job payload:
+
+```json
+{
+  "class": "MyWorker",
+  "args": [...],
+  "multi_tenant": {
+    "class": "Customer",
+    "id": 42
+  }
+}
+```
+
+If no tenant is set, the payload is left unchanged and the server middleware skips tenant setup for that job.
+
+## Server middleware
+
+`Sidekiq::Middleware::MultiTenant::Server` runs before each job executes. It reads the `multi_tenant` key from the payload, loads the tenant record, and wraps the job in `MultiTenant.with`:
+
+```ruby
+MultiTenant.with(tenant) do
+  # your worker's perform method runs here
+end
+```
+
+If the tenant record has been deleted since the job was enqueued, the middleware falls back to using the raw ID so the job can still run (and handle the missing record itself).
+
+## Enqueueing jobs for multiple tenants
+
+Use `Sidekiq::Client.push_bulk_with_tenants` to enqueue a batch of jobs where each job runs under a different tenant. Each entry in `jobs` is a hash with `args` and `tenant_id`:
+
+```ruby
+Sidekiq::Client.push_bulk_with_tenants(
+  'class' => MyWorker,
+  'queue' => 'default',
+  'jobs'  => [
+    { 'args' => [record_id_1], 'tenant_id' => tenant_id_1 },
+    { 'args' => [record_id_2], 'tenant_id' => tenant_id_2 },
+    { 'args' => [record_id_3], 'tenant_id' => tenant_id_3 }
+  ]
+)
+```
+
+The method returns an array of job IDs (one per enqueued job). Each job is processed within the correct tenant context by the server middleware.
+
+The `jobs` array must contain Hashes. Passing a non-Hash element raises `ArgumentError` with a descriptive message.

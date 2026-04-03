@@ -1,0 +1,148 @@
+---
+title: "Write-only mode"
+description: "Safely roll out tenant scoping to an existing Rails app by adding tenant_id to new records before enforcing it on reads."
+---
+
+Adding multi-tenancy to a Rails application that already has data in production requires care. If you enable full tenant scoping immediately, every `SELECT` query that lacks a `WHERE customer_id = ?` clause will return no rows — because most existing rows don't have a `customer_id` yet.
+
+Write-only mode solves this by splitting the rollout into two phases:
+
+1. **Write phase** — `customer_id` is stamped on all new records, but existing queries are not filtered by tenant. Your app continues to work normally.
+2. **Enforce phase** — Once all rows have a valid `customer_id`, you add a `NOT NULL` constraint and remove write-only mode to enable full tenant isolation.
+
+<Warning>
+Write-only mode is a temporary migration aid, not a permanent configuration. Running in write-only mode for longer than necessary means your data has no read-level tenant isolation, which is a security risk in a real multi-tenant application.
+</Warning>
+
+## How write-only mode works
+
+When write-only mode is active, `MultiTenant.with_write_only_mode_enabled?` returns `true`. The `QueryMethodsExtensions#build_arel` method checks this flag before injecting any tenant conditions — and skips the injection entirely when the flag is set:
+
+```ruby
+# From query_rewriter.rb — the guard used in build_arel
+unless MultiTenant.with_write_only_mode_enabled?
+  visitor = MultiTenant::ArelTenantVisitor.new(arel)
+  # inject TenantEnforcementClause nodes for each unhandled relation
+end
+```
+
+The same check is applied inside `DatabaseStatements` for `UPDATE` and `DELETE` statements issued through `join_to_update` and `join_to_delete`.
+
+New records still receive their `customer_id` via the `after_initialize` callback registered by `multi_tenant`, so data written during this phase is correctly scoped even though reads are not yet filtered.
+
+## Enabling write-only mode
+
+Add the following call to an initializer, such as `config/initializers/multi_tenant.rb`:
+
+```ruby
+MultiTenant.enable_write_only_mode
+```
+
+With this line in place:
+
+- All new records get `customer_id` set automatically when a tenant context is active.
+- No `WHERE customer_id = ?` condition is added to `SELECT`, `UPDATE`, or `DELETE` statements.
+- Your existing queries continue to work against all rows.
+
+## Migration path
+
+<Steps>
+  <Step title="Add the customer_id column">
+    Add a nullable `customer_id` column to every table that will be tenant-scoped. Use a regular migration — do not add `NOT NULL` yet.
+
+    ```ruby
+    class AddCustomerIdToSites < ActiveRecord::Migration[7.0]
+      def change
+        add_column :sites, :customer_id, :bigint
+        add_index  :sites, :customer_id
+      end
+    end
+    ```
+  </Step>
+
+  <Step title="Declare multi_tenant on your models">
+    Add `multi_tenant :customer` to each model that belongs to a tenant. Enable write-only mode in an initializer so that existing queries are not immediately broken.
+
+    ```ruby
+    # app/models/site.rb
+    class Site < ActiveRecord::Base
+      multi_tenant :customer
+      has_many :page_views
+    end
+    ```
+
+    ```ruby
+    # config/initializers/multi_tenant.rb
+    MultiTenant.enable_write_only_mode
+    ```
+
+    Deploy this change. From this point forward, new records created within a `MultiTenant.with` block will have their `customer_id` populated.
+  </Step>
+
+  <Step title="Backfill tenant_id on existing rows">
+    Run a backfill to assign a `customer_id` to every row that doesn't have one yet. This can be done as a background job or a one-off rake task.
+
+    ```ruby
+    # Example: backfill sites that belong to a single customer
+    Site.where(customer_id: nil).in_batches do |batch|
+      batch.update_all(customer_id: determine_customer_id_for(batch))
+    end
+    ```
+
+    <Note>
+    While the backfill runs, write-only mode keeps your app operational. New rows get `customer_id` set immediately; you are only catching up rows that existed before the migration.
+    </Note>
+  </Step>
+
+  <Step title="Add the NOT NULL constraint">
+    Once every row has a `customer_id` value, enforce this at the database level. Verify there are no nulls first:
+
+    ```ruby
+    # Confirm no nulls remain before adding the constraint
+    raise "Backfill incomplete" if Site.where(customer_id: nil).exists?
+    ```
+
+    ```ruby
+    class MakeCustomerIdNotNull < ActiveRecord::Migration[7.0]
+      def change
+        change_column_null :sites, :customer_id, false
+      end
+    end
+    ```
+  </Step>
+
+  <Step title="Remove write-only mode">
+    Delete the `MultiTenant.enable_write_only_mode` call from your initializer and deploy. The gem now enforces tenant scoping on all queries — any `SELECT`, `UPDATE`, or `DELETE` without a tenant context will be scoped to the active tenant, and cross-tenant access is prevented.
+
+    ```ruby
+    # config/initializers/multi_tenant.rb
+    # Remove or comment out the line below:
+    # MultiTenant.enable_write_only_mode
+    ```
+
+    Verify your application is working correctly before considering the migration complete.
+  </Step>
+</Steps>
+
+## Checking whether write-only mode is active
+
+You can check the current state at runtime:
+
+```ruby
+MultiTenant.with_write_only_mode_enabled?
+# => true  (while write-only mode is active)
+# => false (after you remove the initializer line)
+```
+
+This is useful in diagnostics, admin dashboards, or conditional logic during the rollout period.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Rolling out multi-tenancy" icon="rocket" href="/guides/rolling-out">
+    A complete guide to planning and executing the multi-tenancy rollout in production.
+  </Card>
+  <Card title="Migrations" icon="database" href="/guides/migrations">
+    How to write Rails migrations for multi-tenant tables, including composite primary keys and indexes.
+  </Card>
+</CardGroup>

@@ -1,0 +1,108 @@
+---
+title: "Model setup"
+description: "Annotate your ActiveRecord models with multi_tenant to scope queries and writes to the current tenant."
+---
+
+## The `multi_tenant` macro
+
+Call `multi_tenant` at the top of any model that belongs to a tenant. Pass the name of the tenant model as a symbol:
+
+```ruby
+class PageView < ActiveRecord::Base
+  multi_tenant :customer
+  belongs_to :site
+
+  # ...
+end
+
+class Site < ActiveRecord::Base
+  multi_tenant :customer
+  has_many :page_views
+
+  # ...
+end
+```
+
+Once annotated, every query on these models is automatically scoped to the current tenant. Inserts set the tenant column automatically, and updates/deletes include the tenant in their `WHERE` clause.
+
+## How it works
+
+When you call `multi_tenant :customer` on a model, the gem does several things:
+
+- Derives the **partition key column** (defaults to `customer_id`).
+- Registers the model so the query rewriter can inject the tenant condition.
+- Creates an implicit `belongs_to :customer` association (if the `Customer` class exists in your app).
+- Guards the tenant column against mutation on persisted records, raising `MultiTenant::TenantIsImmutable` if you try to change it.
+
+## Checking whether a model is scoped
+
+Use `scoped_by_tenant?` to verify that a model has been annotated:
+
+```ruby
+PageView.scoped_by_tenant?  # => true
+Customer.scoped_by_tenant?  # => false (the tenant model itself is not scoped)
+```
+
+This is useful in tests or diagnostic rake tasks.
+
+## The `partition_key` option
+
+By default, the gem derives the partition key column name as `#{tenant_name}_id`. For example, `multi_tenant :customer` expects a column named `customer_id`.
+
+Override this with the `partition_key` option when your column name differs:
+
+```ruby
+class PageView < ActiveRecord::Base
+  multi_tenant :customer, partition_key: 'cust_id'
+end
+```
+
+You can also inspect the resolved key at runtime:
+
+```ruby
+PageView.partition_key  # => "cust_id"
+```
+
+## The `class_name` option
+
+If your tenant model's class name does not match the symbol you pass, use `class_name` to point to the right constant:
+
+```ruby
+class PageView < ActiveRecord::Base
+  multi_tenant :account, class_name: 'Customer'
+end
+```
+
+This mirrors the same option on a standard `belongs_to`, and the implicit association respects it.
+
+## The `optional` option
+
+By default the implicit `belongs_to` association requires the tenant to be present. Pass `optional: true` to relax that constraint:
+
+```ruby
+class PageView < ActiveRecord::Base
+  multi_tenant :customer, optional: true
+end
+```
+
+This is passed directly through to Rails' `belongs_to` and affects validation, not query scoping.
+
+## Implicit `belongs_to` association
+
+When the tenant model class exists in your application, `multi_tenant` automatically creates a `belongs_to` association. The example above is equivalent to writing:
+
+```ruby
+belongs_to :customer, foreign_key: 'customer_id'
+```
+
+You do not need to declare this association yourself. If you need to customise it (e.g. add `inverse_of`), pass the option directly to `multi_tenant`:
+
+```ruby
+class PageView < ActiveRecord::Base
+  multi_tenant :customer, inverse_of: :page_views
+end
+```
+
+<Tip>
+If the tenant model is not defined in your application (for example, your app only connects to a shared database that owns the tenant table), the gem still works. `MultiTenant.with` accepts a raw tenant ID in addition to a model instance, so you never need the class to be loadable.
+</Tip>

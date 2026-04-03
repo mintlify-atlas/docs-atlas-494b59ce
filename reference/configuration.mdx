@@ -1,0 +1,202 @@
+---
+title: Configuration reference
+description: All configurable options for the activerecord-multi-tenant gem, with examples and guidance on when to use each one.
+---
+
+Place gem-level configuration inside an initializer such as `config/initializers/multi_tenant.rb` so it runs once at boot.
+
+<AccordionGroup>
+
+<Accordion title="MultiTenant.enable_write_only_mode">
+
+### Description
+
+Switches the gem into write-only mode. In this mode the tenant ID is automatically stamped on **new** records, but no tenant filter is added to `SELECT`, `UPDATE`, or `DELETE` statements.
+
+### When to use
+
+Write-only mode is designed for **incremental migrations** — situations where you are in the process of adding a tenant ID column to an existing table. You can enable it while backfilling data so that new writes are tagged correctly before you flip the full tenant scoping on.
+
+<Warning>
+  With write-only mode enabled, queries are **not** automatically filtered by tenant. Any code that relies on `multi_tenant` scoping to enforce data isolation will not be protected while this mode is active.
+</Warning>
+
+### Initializer example
+
+```ruby
+# config/initializers/multi_tenant.rb
+MultiTenant.enable_write_only_mode
+```
+
+You can check the current state at runtime:
+
+```ruby
+MultiTenant.with_write_only_mode_enabled? # => true
+```
+
+</Accordion>
+
+<Accordion title="MultiTenant.enable_query_monitor">
+
+### Description
+
+Enables a lightweight `ActiveSupport::Notifications` subscriber that listens on the `sql.active_record` hook. Whenever a query raises an exception **and** no tenant is set, it logs a warning through `Rails.logger`:
+
+```
+WARNING: Tenant not present - make sure to add MultiTenant.with(tenant) { ... }
+```
+
+### When to use
+
+Turn this on in development or staging to catch queries that fall outside a `MultiTenant.with` block or controller filter. It is a diagnostic aid — it does not raise exceptions or block queries.
+
+### Initializer example
+
+```ruby
+# config/initializers/multi_tenant.rb
+MultiTenant.enable_query_monitor
+```
+
+You can check the current state at runtime:
+
+```ruby
+MultiTenant.query_monitor_enabled? # => true
+```
+
+</Accordion>
+
+<Accordion title="MultiTenant.default_tenant_class=">
+
+### Description
+
+Tells the gem which ActiveRecord model class to use as the tenant when only a raw integer or string ID is available (rather than a full object).
+
+### When to use
+
+This setting is required in two situations:
+
+1. **Sidekiq workers** — the Sidekiq server middleware re-hydrates the tenant from the stored class name and ID. If you want `MultiTenant.current_tenant_class` or `MultiTenant.load_current_tenant!` to work when only an ID has been set, you must configure this.
+
+2. **Any context where you set `MultiTenant.current_tenant = some_integer_id`** — for example, when reading a tenant ID from a JWT token and you do not yet need the full object.
+
+### Initializer example
+
+```ruby
+# config/initializers/multi_tenant.rb
+MultiTenant.default_tenant_class = Account
+```
+
+After this, you can load the full object on demand:
+
+```ruby
+MultiTenant.current_tenant = 42          # set raw id
+MultiTenant.load_current_tenant!         # => #<Account id: 42>
+```
+
+<Note>
+  The Sidekiq server middleware does **not** rely on `default_tenant_class`; it stores the tenant class name inside the job payload and re-uses it directly. You only need this setting for code paths that call `current_tenant_class` or `load_current_tenant!`.
+</Note>
+
+</Accordion>
+
+<Accordion title="create_table with partition_key: option">
+
+### Description
+
+The gem patches `ActiveRecord::ConnectionAdapters::SchemaStatements#create_table` to accept an additional `partition_key:` keyword argument. When supplied (and not equal to `"id"`), the migration automatically:
+
+1. Creates the table as normal.
+2. Drops the default single-column primary key constraint.
+3. Re-adds a **composite primary key** of `(partition_key, id)`.
+
+This composite key structure is required by Citus for distributed tables — the distribution column must be part of the primary key.
+
+### Migration example
+
+```ruby
+class CreateProjects < ActiveRecord::Migration[7.1]
+  def change
+    create_table :projects, partition_key: :account_id do |t|
+      t.bigint  :account_id, null: false
+      t.string  :name,       null: false
+      t.timestamps
+    end
+
+    create_distributed_table :projects, :account_id
+  end
+end
+```
+
+<Note>
+  You still need to add the `account_id` column explicitly inside the block. The `partition_key:` option only controls the primary key definition — it does not create the column.
+</Note>
+
+</Accordion>
+
+<Accordion title="multi_tenant :name, partition_key: option">
+
+### Description
+
+By default, `multi_tenant :account` uses `account_id` as the foreign key column. Use `partition_key:` to point to a different column name.
+
+### When to use
+
+Use this option when your schema uses a non-conventional column name for the tenant foreign key — for example `organization_id` in a model that belongs to an `:account` association.
+
+### Model example
+
+```ruby
+class Project < ApplicationRecord
+  multi_tenant :account, partition_key: 'organization_id'
+end
+```
+
+The gem will use `organization_id` for all query scoping, the immutability check, and the automatic `after_initialize` stamp.
+
+</Accordion>
+
+<Accordion title="multi_tenant :name, class_name: option">
+
+### Description
+
+Provides the class name for the tenant association when it cannot be inferred from the `tenant_name` symbol. Passed directly to the underlying `belongs_to` declaration.
+
+### When to use
+
+Use this when the tenant model class name differs from the association name — for example, when you call `multi_tenant :account` but the model is named `Organization`.
+
+### Model example
+
+```ruby
+class Project < ApplicationRecord
+  multi_tenant :account, class_name: 'Organization'
+end
+```
+
+</Accordion>
+
+<Accordion title="multi_tenant :name, optional: true">
+
+### Description
+
+Marks the auto-generated `belongs_to :tenant_name` association as optional, suppressing the default Rails presence validation on the foreign key.
+
+### When to use
+
+Use this during a migration where some existing records do not yet have a tenant ID assigned, or in scenarios where a record may legitimately exist without a tenant (e.g. system-level records).
+
+### Model example
+
+```ruby
+class AuditLog < ApplicationRecord
+  multi_tenant :account, optional: true
+end
+```
+
+<Warning>
+  Setting `optional: true` means ActiveRecord will not validate the presence of `account_id`. Ensure your application logic handles `nil` tenant values explicitly to avoid unintended data leaks.
+</Warning>
+
+</Accordion>
+
+</AccordionGroup>

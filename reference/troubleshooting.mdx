@@ -1,0 +1,246 @@
+---
+title: Troubleshooting
+description: Solutions to common issues you may encounter when using the activerecord-multi-tenant gem.
+---
+
+<AccordionGroup>
+
+<Accordion title="Tenant scope is not applied to queries">
+
+### Symptoms
+
+Queries return rows from all tenants instead of just the current one. Joining or eager-loading associations produces cross-tenant results.
+
+### Cause
+
+The current tenant has not been set before the queries execute.
+
+### Solution
+
+Wrap the relevant code in a `MultiTenant.with` block or ensure your controller `before_action` calls `set_current_tenant` before any database access.
+
+**Using `MultiTenant.with` directly:**
+
+```ruby
+MultiTenant.with(current_account) do
+  site = Site.find(params[:site_id])
+  site.update!(last_accessed_at: Time.now)
+  site.page_views.count
+end
+```
+
+**Using a controller filter:**
+
+```ruby
+class ApplicationController < ActionController::Base
+  set_current_tenant_through_filter
+
+  before_action :set_tenant
+
+  private
+
+  def set_tenant
+    account = Account.find_by!(subdomain: request.subdomain)
+    set_current_tenant(account)
+  end
+end
+```
+
+<Tip>
+  Enable `MultiTenant.enable_query_monitor` in development. It logs a warning whenever a query fails with no tenant set, making it easier to track down un-scoped call sites.
+</Tip>
+
+</Accordion>
+
+<Accordion title="TenantIsImmutable exception">
+
+### Symptoms
+
+```
+MultiTenant::TenantIsImmutable
+```
+
+Raised when saving a record or assigning a new value to the tenant foreign key column (e.g. `account_id`).
+
+### Cause
+
+The `activerecord-multi-tenant` gem enforces that a record's tenant ID cannot change once the record has been persisted. This is a deliberate constraint — Citus distributed tables require rows to live on the same shard as determined by the distribution column, so reassigning the tenant ID would require moving the row across shards.
+
+### Solution
+
+You cannot change a persisted record's tenant. If you genuinely need to move data between tenants:
+
+1. Read the record under the original tenant.
+2. Create a new record under the destination tenant with the same attributes.
+3. Delete the original record.
+
+```ruby
+MultiTenant.with(source_account) do
+  original = Project.find(project_id)
+  attrs = original.attributes.except('id', 'account_id')
+  original.destroy!
+
+  MultiTenant.with(destination_account) do
+    Project.create!(attrs)
+  end
+end
+```
+
+<Warning>
+  Never attempt to bypass the immutability check by calling `update_columns` directly on the distribution column — doing so on a Citus distributed table will corrupt shard placement.
+</Warning>
+
+</Accordion>
+
+<Accordion title="RuntimeError: Only have tenant id, and no default tenant class set">
+
+### Symptoms
+
+```
+RuntimeError: Only have tenant id, and no default tenant class set
+```
+
+Raised from `MultiTenant.current_tenant_class` or `MultiTenant.load_current_tenant!`.
+
+### Cause
+
+The current tenant was set as a raw integer or string ID (rather than a full ActiveRecord object), and the gem does not know which model class to use to look it up.
+
+This commonly happens in Sidekiq workers when the middleware stores the tenant ID but your worker code calls `MultiTenant.load_current_tenant!` or `MultiTenant.current_tenant_class`.
+
+### Solution
+
+Configure `default_tenant_class` in your initializer:
+
+```ruby
+# config/initializers/multi_tenant.rb
+MultiTenant.default_tenant_class = Account
+```
+
+After this, you can safely call:
+
+```ruby
+MultiTenant.load_current_tenant!
+# => #<Account id: 42>
+```
+
+</Accordion>
+
+<Accordion title="Missing tenant_id column / PG::UndefinedColumn error">
+
+### Symptoms
+
+```
+PG::UndefinedColumn: ERROR: column "account_id" does not exist
+```
+
+Or new records are saved without the tenant ID column being populated.
+
+### Cause
+
+The `multi_tenant :account` macro expects a column named `account_id` (or whichever `partition_key:` you specified) to exist in the table. If the migration that adds this column has not been run, or if the column name does not match, the gem cannot function.
+
+### Solution
+
+1. Verify the column exists:
+
+   ```ruby
+   rails db:schema:dump
+   # look for the account_id column in your table definition
+   ```
+
+2. If the column is missing, generate and run a migration:
+
+   ```ruby
+   rails generate migration AddAccountIdToProjects account_id:bigint:index
+   ```
+
+   ```ruby
+   class AddAccountIdToProjects < ActiveRecord::Migration[7.1]
+     def change
+       add_column    :projects, :account_id, :bigint, null: false
+       add_index     :projects, :account_id
+       create_distributed_table :projects, :account_id
+     end
+   end
+   ```
+
+3. If you used a custom partition key in your model, make sure the column name in the database matches:
+
+   ```ruby
+   multi_tenant :account, partition_key: 'organization_id'
+   # column in the DB must be `organization_id`
+   ```
+
+</Accordion>
+
+<Accordion title="Can I use multiple tenant models in the same application?">
+
+Yes. Different ActiveRecord models can declare `multi_tenant` with different tenant association names. For example, you might have some models scoped to `Account` and others scoped to `Team`.
+
+```ruby
+class Project < ApplicationRecord
+  multi_tenant :account
+end
+
+class Task < ApplicationRecord
+  multi_tenant :team
+end
+```
+
+However, you can only set **one** current tenant at a time via `MultiTenant.current_tenant`. If your application needs concurrent context for two different tenant types, you will need to manage the second tenant context manually (e.g. by using `MultiTenant.with` in nested blocks or passing the tenant explicitly).
+
+</Accordion>
+
+<Accordion title="What about tables that do not relate to a tenant?">
+
+Tables that represent global or shared data (e.g. `countries`, `currencies`, feature-flag definitions) should not call `multi_tenant`. Simply omit the macro and the gem will leave those tables unscoped.
+
+For Citus deployments, declare these as **reference tables** in your migration so they are replicated to every worker node and can be joined efficiently:
+
+```ruby
+create_table :countries do |t|
+  t.string :code, null: false
+  t.string :name, null: false
+end
+
+create_reference_table :countries
+```
+
+If you are using Citus and a table must be distributed but some rows are legitimately shared (not owned by any tenant), the community convention is to use a sentinel tenant ID of `0`:
+
+```ruby
+MultiTenant.with(0) do
+  SharedConfig.create!(key: 'maintenance_mode', value: 'false')
+end
+```
+
+</Accordion>
+
+<Accordion title="Does this gem support MySQL?">
+
+Not fully. The gem is primarily designed for **PostgreSQL** and the **Citus** distributed PostgreSQL extension.
+
+MySQL may work for basic `multi_tenant` scoping, but known issues exist:
+
+- `db:schema:dump` is broken when using this gem with MySQL (see [#166](https://github.com/citusdata/activerecord-multi-tenant/issues/166) — fixed in 2.1.4 with a rescue guard, but the schema dumper output may still be incomplete).
+- All Citus-specific migration helpers (`create_distributed_table`, `create_reference_table`, etc.) are no-ops on non-Citus connections, so your schema will not actually be distributed.
+- The `copy_from_client` helper uses the `pg` gem's `COPY` protocol and will not work on MySQL.
+
+If your application only needs tenant scoping (no Citus distribution), PostgreSQL remains the recommended database.
+
+</Accordion>
+
+<Accordion title="Does this work with Sequel?">
+
+No. This gem is built exclusively for **ActiveRecord**. It hooks into `ActiveRecord::Base`, `ActiveRecord::Migration`, `ActiveRecord::Associations`, and Rails controller/initializer load hooks. There is no Sequel adapter.
+
+If you need multi-tenancy with Sequel, search RubyGems for a Sequel-specific multi-tenancy plugin — this gem does not support it.
+
+</Accordion>
+
+</AccordionGroup>
+
+## Reporting bugs and requesting features
+
+If you encounter an issue not covered here, please open a GitHub issue at [https://github.com/citusdata/activerecord-multi-tenant/issues](https://github.com/citusdata/activerecord-multi-tenant/issues). Include the gem version, Rails version, PostgreSQL/Citus version, and a minimal reproduction case.

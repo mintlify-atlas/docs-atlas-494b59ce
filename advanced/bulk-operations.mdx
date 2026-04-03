@@ -1,0 +1,133 @@
+---
+title: "Bulk operations"
+description: "Load large data sets with the PostgreSQL COPY command and truncate tables quickly between tests."
+---
+
+The gem ships two utilities for high-throughput data management: `copy_from_client` for bulk inserts using the PostgreSQL `COPY` protocol, and `FastTruncate` for resetting your database between test runs faster than DatabaseCleaner's truncation strategy.
+
+## Bulk insertion with `copy_from_client`
+
+### How it works
+
+`copy_from_client` uses the PostgreSQL binary `COPY … FROM STDIN` command through the `pg` gem's `copy_data` interface. It is mixed into every ActiveRecord model via:
+
+```ruby
+ActiveSupport.on_load(:active_record) do |base|
+  base.extend(MultiTenant::CopyFromClient)
+end
+```
+
+The method signature is:
+
+```ruby
+copy_from_client(columns, &block)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `columns` | `Array<Symbol\|String>` | Ordered list of column names to populate. |
+| `block` | `Proc` | Receives a `CopyFromClientHelper` instance. Call `<<` on it to append rows. |
+
+The method returns the total number of rows inserted.
+
+<Note>
+  `copy_from_client` requires the `pg` gem and a live PostgreSQL connection. It uses `connection.raw_connection` directly, so it does not work with other database adapters.
+</Note>
+
+### The `CopyFromClientHelper`
+
+Inside the block you receive a `CopyFromClientHelper` object. Each call to `<<` with an array of values serializes the row using the column's ActiveRecord type and streams it to the server via `PG::TextEncoder::CopyRow`.
+
+```ruby
+helper << [value1, value2, value3]
+```
+
+Type serialization is handled automatically — you pass Ruby objects and the helper converts them to the correct PostgreSQL text representation using `type_for_attribute`.
+
+### Usage example
+
+```ruby
+# Bulk-insert 10,000 events for the current account
+Event.copy_from_client([:account_id, :name, :occurred_at]) do |copy|
+  10_000.times do |i|
+    copy << [current_account.id, "event_#{i}", Time.current]
+  end
+end
+```
+
+You can capture the return value to confirm how many rows were written:
+
+```ruby
+count = Event.copy_from_client([:account_id, :name, :occurred_at]) do |copy|
+  rows.each { |row| copy << row }
+end
+
+Rails.logger.info "Inserted #{count} events"
+```
+
+### Wrapping in a transaction
+
+Because `COPY` streams data directly to PostgreSQL, wrap the call in a transaction if you need atomicity:
+
+```ruby
+ActiveRecord::Base.transaction do
+  Event.copy_from_client([:account_id, :name, :occurred_at]) do |copy|
+    rows.each { |row| copy << row }
+  end
+end
+```
+
+---
+
+## Fast table truncation with `FastTruncate`
+
+### How it works
+
+`MultiTenant::FastTruncate.run` executes a PL/pgSQL block that:
+
+1. Iterates over every table in the `public` schema, excluding any tables in the `exclude:` list.
+2. For each table, checks whether its `_id_seq` sequence has been called (meaning rows were inserted).
+3. Collects only the tables that need truncating and runs a single `TRUNCATE TABLE … RESTART IDENTITY CASCADE` statement.
+
+This avoids truncating tables that were never written to, which is the key reason it is faster than `DatabaseCleaner.clean_with(:truncation, pre_count: true)`.
+
+### Method signature
+
+```ruby
+MultiTenant::FastTruncate.run(exclude: ['schema_migrations'])
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `exclude:` | `Array<String>` | `['schema_migrations']` | Table names to skip. Always include `'schema_migrations'` to preserve migration history. |
+
+### Usage in tests
+
+<Steps>
+  <Step title="Add to your test helper">
+    Call `FastTruncate.run` in your RSpec or Minitest teardown instead of the DatabaseCleaner truncation strategy.
+
+    ```ruby spec/support/fast_truncate.rb
+    RSpec.configure do |config|
+      config.after(:each) do
+        MultiTenant::FastTruncate.run
+      end
+    end
+    ```
+  </Step>
+  <Step title="Exclude additional tables if needed">
+    Pass extra table names that should never be truncated, such as lookup tables populated by seeds:
+
+    ```ruby
+    MultiTenant::FastTruncate.run(exclude: ['schema_migrations', 'countries', 'currencies'])
+    ```
+  </Step>
+</Steps>
+
+### Why FastTruncate is faster
+
+DatabaseCleaner's truncation strategy issues individual `TRUNCATE` calls per table (even when `pre_count: true` is set it still incurs per-table overhead). `FastTruncate` builds a single `TRUNCATE TABLE t1, t2, t3 RESTART IDENTITY CASCADE` statement covering only the tables that actually contain rows, minimising round-trips and lock acquisition overhead.
+
+<Note>
+  `FastTruncate` uses a raw SQL `DO … $$` block, so it requires PostgreSQL. It is not compatible with SQLite or MySQL adapters.
+</Note>

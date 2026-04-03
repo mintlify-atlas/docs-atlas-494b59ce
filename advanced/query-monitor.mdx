@@ -1,0 +1,86 @@
+---
+title: "Query monitor"
+description: "Catch missing tenant context at query time by enabling the built-in query monitor."
+---
+
+The query monitor hooks into ActiveSupport notifications and logs a warning whenever a query raises an exception while no tenant is set. It is a lightweight safety net that helps you discover missing `MultiTenant.with` blocks before they reach production.
+
+## How it works
+
+Every time ActiveRecord executes SQL, it emits a `sql.active_record` notification. The query monitor subscribes to that notification via:
+
+```ruby
+ActiveSupport::Notifications.subscribe('sql.active_record', MultiTenant::QueryMonitor.new)
+```
+
+On each notification, the `QueryMonitor#finish` callback checks two conditions:
+
+1. The notification payload contains an `:exception` — the query failed.
+2. `MultiTenant.current_tenant_id` is `nil` — no tenant is active for this thread.
+
+When both conditions are true, it writes the following message to the Rails log:
+
+```
+WARNING: Tenant not present - make sure to add MultiTenant.with(tenant) { ... }
+```
+
+Because the check is gated on `query_monitor_enabled?`, there is zero overhead when the monitor is off.
+
+## Enabling the query monitor
+
+Call `MultiTenant.enable_query_monitor` inside a Rails initializer.
+
+<Steps>
+  <Step title="Create an initializer">
+    Add a new file at `config/initializers/multi_tenant.rb` (or open your existing one).
+  </Step>
+  <Step title="Enable the monitor">
+    ```ruby config/initializers/multi_tenant.rb
+    MultiTenant.enable_query_monitor
+    ```
+  </Step>
+  <Step title="Restart the server">
+    Restart your Rails server or test suite runner so the initializer takes effect.
+  </Step>
+</Steps>
+
+## Example: catching a missing tenant
+
+The warning surfaces whenever a query fails without a tenant in scope. A typical scenario is forgetting to wrap a controller action:
+
+```ruby
+# Bad — no tenant set, query failure will trigger the warning
+Project.find(params[:id])
+
+# Good — tenant is established before the query runs
+MultiTenant.with(current_account) do
+  Project.find(params[:id])
+end
+```
+
+When the first example raises an `ActiveRecord::RecordNotFound` (or any other query exception), you will see the warning in your logs immediately.
+
+## When to use the query monitor
+
+The query monitor is most valuable during **development and testing**, where you want immediate feedback about code paths that forget to set a tenant.
+
+<Tip>
+  Enable the query monitor in `development` and `test` environments by wrapping it in an environment check:
+
+  ```ruby config/initializers/multi_tenant.rb
+  MultiTenant.enable_query_monitor unless Rails.env.production?
+  ```
+
+  In production the monitor adds a small per-notification overhead and the warning message may not be actionable without additional context. Consider disabling it there, or replacing it with your own `ActiveSupport::Notifications` subscriber that feeds into your error tracker.
+</Tip>
+
+## Checking the monitor state
+
+You can inspect whether the monitor is active at any point:
+
+```ruby
+MultiTenant.query_monitor_enabled?
+# => true
+```
+
+This is useful inside conditional logic or in specs that assert on monitor state.
